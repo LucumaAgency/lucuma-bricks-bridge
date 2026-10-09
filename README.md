@@ -6,7 +6,8 @@ se importen directo, sin abrir Bricks ni pegar a mano.
 
 ## Instalación
 
-1. Plugins → Añadir nuevo → Subir plugin → `lucuma-bricks-bridge.zip` → Activar.
+1. Plugins → Añadir nuevo → Subir plugin → `lucuma-bricks-bridge.zip` → Activar. O por Git: el archivo
+   principal está en la raíz del repo, así que cualquier desplegador desde Git lo reconoce como plugin.
 2. Comprobar: `https://lucumaagency.com/wp-json/lucuma-bricks/v1/health` → `{"ok":true,"bricks":"2.x"}`.
 3. Autenticación: la misma contraseña de aplicación del usuario Developer (`~/.lucuma-wp.env`).
    Solo usuarios con permiso de editar la página pueden escribir.
