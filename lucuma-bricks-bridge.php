@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración.
- * Version: 1.0.3
+ * Version: 1.0.4
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -13,6 +13,8 @@ class Lucuma_Bricks_Bridge {
 
 	const NS            = 'lucuma-bricks/v1';
 	const META_CONTENT  = '_bricks_page_content_2';
+	/** Clave antigua: algunas plantillas (p. ej. footers creados con Bricks viejo) siguen ahí. */
+	const META_CONTENT_LEGACY = '_bricks_page_content';
 	const META_MODE     = '_bricks_editor_mode';
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
@@ -30,7 +32,7 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/health', [
 			'methods' => 'GET', 'permission_callback' => '__return_true',
 			'callback' => function () {
-				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.3' ];
+				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.4' ];
 			},
 		] );
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)', [
@@ -46,7 +48,7 @@ class Lucuma_Bricks_Bridge {
 			'methods' => 'POST', 'permission_callback' => $perm,
 			'callback' => function ( $req ) {
 				$id = (int) $req['id'];
-				$c  = get_post_meta( $id, self::META_CONTENT, true );
+				$c  = get_post_meta( $id, self::content_key( $id ), true );
 				if ( ! is_array( $c ) ) return new WP_Error( 'not_found', 'Sin contenido Bricks', [ 'status' => 404 ] );
 				return [ 'ok' => true, 'id' => $id, 'css' => self::regenerate_css( $id, $c ) ];
 			},
@@ -60,12 +62,22 @@ class Lucuma_Bricks_Bridge {
 		] );
 	}
 
+	/** Clave donde vive el contenido Bricks de este post (la nueva si hay algo, si no la antigua). */
+	private static function content_key( $id ) {
+		$c = get_post_meta( $id, self::META_CONTENT, true );
+		if ( is_array( $c ) && $c ) return self::META_CONTENT;
+		$l = get_post_meta( $id, self::META_CONTENT_LEGACY, true );
+		if ( is_array( $l ) && $l ) return self::META_CONTENT_LEGACY;
+		return self::META_CONTENT;
+	}
+
 	/* ---------- GET /pages/{id} ---------- */
 	public static function get_page( $req ) {
 		$id   = (int) $req['id'];
 		$post = get_post( $id );
 		if ( ! $post ) return new WP_Error( 'not_found', 'Página no encontrada', [ 'status' => 404 ] );
-		$content = get_post_meta( $id, self::META_CONTENT, true );
+		$key     = self::content_key( $id );
+		$content = get_post_meta( $id, $key, true );
 		$backups = get_post_meta( $id, self::META_BACKUPS, true );
 		return [
 			'id'       => $id,
@@ -101,7 +113,8 @@ class Lucuma_Bricks_Bridge {
 		$check = self::validate( $elements );
 		if ( is_wp_error( $check ) ) return $check;
 
-		$current = get_post_meta( $id, self::META_CONTENT, true );
+		$key     = self::content_key( $id );
+		$current = get_post_meta( $id, $key, true );
 		$current = is_array( $current ) ? $current : [];
 
 		if ( $regen ) $elements = self::regenerate_ids( $elements, $current );
@@ -111,7 +124,7 @@ class Lucuma_Bricks_Bridge {
 
 		$backup_key = self::backup( $id, $current, $nota ?: 'antes de ' . $mode );
 
-		update_post_meta( $id, self::META_CONTENT, wp_slash( $new ) );
+		update_post_meta( $id, $key, wp_slash( $new ) );
 		update_post_meta( $id, self::META_MODE, 'bricks' );
 		wp_update_post( [ 'ID' => $id ] ); // toca modified y limpia cachés de objeto (los hooks de Bricks pueden vaciar el CSS: por eso se regenera DESPUÉS)
 		$css = self::regenerate_css( $id, $new );
@@ -140,9 +153,10 @@ class Lucuma_Bricks_Bridge {
 		$found = null;
 		foreach ( $backups as $b ) if ( $b['key'] === $key ) $found = $b;
 		if ( ! $found ) return new WP_Error( 'bad_key', 'Respaldo no encontrado', [ 'status' => 404 ] );
-		$current = get_post_meta( $id, self::META_CONTENT, true );
+		$ckey    = self::content_key( $id );
+		$current = get_post_meta( $id, $ckey, true );
 		self::backup( $id, is_array( $current ) ? $current : [], 'antes de restaurar ' . $key );
-		update_post_meta( $id, self::META_CONTENT, wp_slash( $found['content'] ) );
+		update_post_meta( $id, $ckey, wp_slash( $found['content'] ) );
 		wp_update_post( [ 'ID' => $id ] );
 		self::regenerate_css( $id, $found['content'] );
 		return [ 'ok' => true, 'restored' => $key, 'elements' => count( $found['content'] ) ];
