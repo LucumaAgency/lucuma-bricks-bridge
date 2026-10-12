@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración.
- * Version: 1.0.1
+ * Version: 1.0.2
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -30,7 +30,7 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/health', [
 			'methods' => 'GET', 'permission_callback' => '__return_true',
 			'callback' => function () {
-				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.1' ];
+				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.2' ];
 			},
 		] );
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)', [
@@ -41,6 +41,15 @@ class Lucuma_Bricks_Bridge {
 		] );
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)/restore', [
 			'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'restore' ],
+		] );
+		register_rest_route( self::NS, '/pages/(?P<id>\d+)/css', [
+			'methods' => 'POST', 'permission_callback' => $perm,
+			'callback' => function ( $req ) {
+				$id = (int) $req['id'];
+				$c  = get_post_meta( $id, self::META_CONTENT, true );
+				if ( ! is_array( $c ) ) return new WP_Error( 'not_found', 'Sin contenido Bricks', [ 'status' => 404 ] );
+				return [ 'ok' => true, 'id' => $id, 'css' => self::regenerate_css( $id, $c ) ];
+			},
 		] );
 		register_rest_route( self::NS, '/pages', [
 			'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'create_page' ],
@@ -104,7 +113,7 @@ class Lucuma_Bricks_Bridge {
 
 		update_post_meta( $id, self::META_CONTENT, wp_slash( $new ) );
 		update_post_meta( $id, self::META_MODE, 'bricks' );
-		self::regenerate_css( $id, $new );
+		$css = self::regenerate_css( $id, $new );
 		wp_update_post( [ 'ID' => $id ] ); // toca modified y limpia cachés de objeto
 
 		return [
@@ -117,6 +126,7 @@ class Lucuma_Bricks_Bridge {
 			'ids_regenerated' => $regen,
 			'classes_added' => $classes_added,
 			'backup'        => $backup_key,
+			'css'           => $css,
 		];
 	}
 
@@ -229,12 +239,59 @@ class Lucuma_Bricks_Bridge {
 		return $key;
 	}
 
-	/** Si Bricks sirve el CSS como archivos externos, regenera el de esta página. */
+	/**
+	 * Si Bricks sirve el CSS como archivos externos, regenera el de esta página.
+	 * En contexto REST Bricks no tiene cargados sus elementos y puede generar un CSS
+	 * vacío (lo que borra el archivo y deja la página sin estilos). Por eso: se cargan
+	 * los elementos antes, se verifica el resultado y, si queda vacío, se restaura el
+	 * archivo anterior. Devuelve un pequeño informe.
+	 */
 	private static function regenerate_css( $id, $elements ) {
-		if ( class_exists( '\Bricks\Assets_Files' ) && method_exists( '\Bricks\Assets_Files', 'generate_post_css_file' ) ) {
-			try { \Bricks\Assets_Files::generate_post_css_file( $id, 'content', $elements ); } catch ( \Throwable $t ) {}
+		$info = [ 'mode' => 'inline', 'status' => 'skipped' ];
+		if ( ! class_exists( '\Bricks\Assets_Files' ) || ! method_exists( '\Bricks\Assets_Files', 'generate_post_css_file' ) ) return $info;
+
+		$dir  = trailingslashit( wp_upload_dir()['basedir'] ) . 'bricks/css/';
+		$file = $dir . 'post-' . $id . '.min.css';
+		$prev = file_exists( $file ) ? (string) file_get_contents( $file ) : null;
+		$info = [ 'mode' => 'file', 'file' => basename( $file ), 'before' => $prev === null ? null : strlen( $prev ) ];
+
+		// Elementos que llevan estilos propios (ajustes "_..."): su CSS debe aparecer en el archivo.
+		$styled = 0;
+		foreach ( $elements as $e ) {
+			$st = isset( $e['settings'] ) && is_array( $e['settings'] ) ? $e['settings'] : [];
+			foreach ( $st as $k => $v ) if ( is_string( $k ) && $k !== '' && $k[0] === '_' ) { $styled++; break; }
+		}
+		$info['styled_elements'] = $styled;
+
+		// Cargar elementos de Bricks (fuera del builder/frontend no están registrados).
+		try {
+			if ( class_exists( '\Bricks\Elements' ) ) {
+				if ( method_exists( '\Bricks\Elements', 'init_elements' ) ) \Bricks\Elements::init_elements();
+				elseif ( method_exists( '\Bricks\Elements', 'register_elements' ) ) \Bricks\Elements::register_elements();
+			}
+		} catch ( \Throwable $t ) { $info['init_error'] = $t->getMessage(); }
+
+		try { \Bricks\Assets_Files::generate_post_css_file( $id, 'content', $elements ); }
+		catch ( \Throwable $t ) { $info['gen_error'] = $t->getMessage(); }
+
+		clearstatcache();
+		$new = file_exists( $file ) ? (string) file_get_contents( $file ) : null;
+		$info['after'] = $new === null ? null : strlen( $new );
+		$rules = $new === null ? 0 : preg_match_all( '/\.brxe-[a-z0-9]{6}\b/', $new );
+		$info['rules'] = $rules;
+
+		$empty = $styled > 0 && $rules === 0;
+		if ( $empty && $prev !== null && $prev !== '' ) {
+			if ( ! is_dir( $dir ) ) wp_mkdir_p( $dir );
+			file_put_contents( $file, $prev );
+			$info['status'] = 'empty_restored_previous';
+		} elseif ( $empty ) {
+			$info['status'] = 'empty_no_previous';
+		} else {
+			$info['status'] = 'ok';
 		}
 		if ( function_exists( 'wp_cache_flush' ) ) wp_cache_flush();
+		return $info;
 	}
 }
 Lucuma_Bricks_Bridge::init();
