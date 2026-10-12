@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -30,7 +30,7 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/health', [
 			'methods' => 'GET', 'permission_callback' => '__return_true',
 			'callback' => function () {
-				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.2' ];
+				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.3' ];
 			},
 		] );
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)', [
@@ -113,8 +113,8 @@ class Lucuma_Bricks_Bridge {
 
 		update_post_meta( $id, self::META_CONTENT, wp_slash( $new ) );
 		update_post_meta( $id, self::META_MODE, 'bricks' );
+		wp_update_post( [ 'ID' => $id ] ); // toca modified y limpia cachés de objeto (los hooks de Bricks pueden vaciar el CSS: por eso se regenera DESPUÉS)
 		$css = self::regenerate_css( $id, $new );
-		wp_update_post( [ 'ID' => $id ] ); // toca modified y limpia cachés de objeto
 
 		return [
 			'ok'            => true,
@@ -143,8 +143,8 @@ class Lucuma_Bricks_Bridge {
 		$current = get_post_meta( $id, self::META_CONTENT, true );
 		self::backup( $id, is_array( $current ) ? $current : [], 'antes de restaurar ' . $key );
 		update_post_meta( $id, self::META_CONTENT, wp_slash( $found['content'] ) );
-		self::regenerate_css( $id, $found['content'] );
 		wp_update_post( [ 'ID' => $id ] );
+		self::regenerate_css( $id, $found['content'] );
 		return [ 'ok' => true, 'restored' => $key, 'elements' => count( $found['content'] ) ];
 	}
 
