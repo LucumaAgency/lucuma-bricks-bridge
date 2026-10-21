@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Lucuma Bricks Bridge
- * Description: Endpoint REST para leer y escribir el contenido Bricks de una página desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración.
- * Version: 1.0.4
+ * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración.
+ * Version: 1.0.5
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -15,6 +15,8 @@ class Lucuma_Bricks_Bridge {
 	const META_CONTENT  = '_bricks_page_content_2';
 	/** Clave antigua: algunas plantillas (p. ej. footers creados con Bricks viejo) siguen ahí. */
 	const META_CONTENT_LEGACY = '_bricks_page_content';
+	/** Áreas de plantilla (header y footer de Bricks guardan sus elementos aparte). */
+	const META_AREAS    = [ 'header' => '_bricks_page_header_2', 'footer' => '_bricks_page_footer_2' ];
 	const META_MODE     = '_bricks_editor_mode';
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
@@ -32,7 +34,7 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/health', [
 			'methods' => 'GET', 'permission_callback' => '__return_true',
 			'callback' => function () {
-				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.4' ];
+				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.5' ];
 			},
 		] );
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)', [
@@ -47,14 +49,19 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)/css', [
 			'methods' => 'POST', 'permission_callback' => $perm,
 			'callback' => function ( $req ) {
-				$id = (int) $req['id'];
-				$c  = get_post_meta( $id, self::content_key( $id ), true );
+				$id   = (int) $req['id'];
+				$area = self::area( $req );
+				if ( is_wp_error( $area ) ) return $area;
+				$c  = get_post_meta( $id, self::key_for( $id, $area ), true );
 				if ( ! is_array( $c ) ) return new WP_Error( 'not_found', 'Sin contenido Bricks', [ 'status' => 404 ] );
-				return [ 'ok' => true, 'id' => $id, 'css' => self::regenerate_css( $id, $c ) ];
+				return [ 'ok' => true, 'id' => $id, 'area' => $area, 'css' => self::regenerate_css( $id, $c, $area ) ];
 			},
 		] );
 		register_rest_route( self::NS, '/pages', [
 			'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'create_page' ],
+		] );
+		register_rest_route( self::NS, '/templates', [
+			'methods' => 'GET', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'list_templates' ],
 		] );
 		register_rest_route( self::NS, '/classes', [
 			'methods' => 'GET', 'permission_callback' => $perm,
@@ -71,12 +78,39 @@ class Lucuma_Bricks_Bridge {
 		return self::META_CONTENT;
 	}
 
+	/** 'content' (por defecto), 'header' o 'footer'. Devuelve WP_Error si es otra cosa. */
+	private static function area( $req ) {
+		$a = $req->get_param( 'area' );
+		if ( $a === null ) { $b = $req->get_json_params(); $a = is_array( $b ) && isset( $b['area'] ) ? $b['area'] : 'content'; }
+		if ( $a !== 'content' && ! isset( self::META_AREAS[ $a ] ) ) return new WP_Error( 'bad_area', 'area debe ser content, header o footer', [ 'status' => 400 ] );
+		return $a;
+	}
+
+	private static function key_for( $id, $area ) {
+		return $area === 'content' ? self::content_key( $id ) : self::META_AREAS[ $area ];
+	}
+
+	/* ---------- GET /templates ---------- */
+	public static function list_templates() {
+		$q = get_posts( [ 'post_type' => 'bricks_template', 'post_status' => 'any', 'numberposts' => 200 ] );
+		return array_map( function ( $p ) {
+			$n = [];
+			foreach ( array_merge( [ 'content' => self::content_key( $p->ID ) ], self::META_AREAS ) as $a => $k ) {
+				$c = get_post_meta( $p->ID, $k, true ); $n[ $a ] = is_array( $c ) ? count( $c ) : 0;
+			}
+			return [ 'id' => $p->ID, 'title' => $p->post_title, 'status' => $p->post_status,
+				'type' => get_post_meta( $p->ID, '_bricks_template_type', true ), 'elements' => $n ];
+		}, $q );
+	}
+
 	/* ---------- GET /pages/{id} ---------- */
 	public static function get_page( $req ) {
 		$id   = (int) $req['id'];
 		$post = get_post( $id );
 		if ( ! $post ) return new WP_Error( 'not_found', 'Página no encontrada', [ 'status' => 404 ] );
-		$key     = self::content_key( $id );
+		$area = self::area( $req );
+		if ( is_wp_error( $area ) ) return $area;
+		$key     = self::key_for( $id, $area );
 		$content = get_post_meta( $id, $key, true );
 		$backups = get_post_meta( $id, self::META_BACKUPS, true );
 		return [
@@ -86,9 +120,11 @@ class Lucuma_Bricks_Bridge {
 			'status'   => $post->post_status,
 			'link'     => get_permalink( $id ),
 			'mode'     => get_post_meta( $id, self::META_MODE, true ),
+			'post_type' => $post->post_type,
+			'area'     => $area,
 			'elements' => is_array( $content ) ? count( $content ) : 0,
 			'content'  => is_array( $content ) ? $content : [],
-			'backups'  => is_array( $backups ) ? array_map( function ( $b ) { return [ 'key' => $b['key'], 'date' => $b['date'], 'elements' => count( $b['content'] ), 'nota' => $b['nota'] ]; }, $backups ) : [],
+			'backups'  => is_array( $backups ) ? array_map( function ( $b ) { return [ 'key' => $b['key'], 'date' => $b['date'], 'elements' => count( $b['content'] ), 'nota' => $b['nota'], 'area' => $b['area'] ?? 'content' ]; }, $backups ) : [],
 		];
 	}
 
@@ -113,7 +149,9 @@ class Lucuma_Bricks_Bridge {
 		$check = self::validate( $elements );
 		if ( is_wp_error( $check ) ) return $check;
 
-		$key     = self::content_key( $id );
+		$area = self::area( $req );
+		if ( is_wp_error( $area ) ) return $area;
+		$key     = self::key_for( $id, $area );
 		$current = get_post_meta( $id, $key, true );
 		$current = is_array( $current ) ? $current : [];
 
@@ -122,18 +160,19 @@ class Lucuma_Bricks_Bridge {
 
 		$new = $mode === 'append' ? array_merge( $current, $elements ) : $elements;
 
-		$backup_key = self::backup( $id, $current, $nota ?: 'antes de ' . $mode );
+		$backup_key = self::backup( $id, $current, $nota ?: 'antes de ' . $mode, $area );
 
 		update_post_meta( $id, $key, wp_slash( $new ) );
-		update_post_meta( $id, self::META_MODE, 'bricks' );
+		if ( $area === 'content' ) update_post_meta( $id, self::META_MODE, 'bricks' );
 		wp_update_post( [ 'ID' => $id ] ); // toca modified y limpia cachés de objeto (los hooks de Bricks pueden vaciar el CSS: por eso se regenera DESPUÉS)
-		$css = self::regenerate_css( $id, $new );
+		$css = self::regenerate_css( $id, $new, $area );
 
 		return [
 			'ok'            => true,
 			'id'            => $id,
 			'link'          => get_permalink( $id ),
 			'mode'          => $mode,
+			'area'          => $area,
 			'elements'      => count( $new ),
 			'roots'         => count( array_filter( $new, function ( $e ) { return ( $e['parent'] ?? 0 ) === 0 || $e['parent'] === '0'; } ) ),
 			'ids_regenerated' => $regen,
@@ -153,13 +192,14 @@ class Lucuma_Bricks_Bridge {
 		$found = null;
 		foreach ( $backups as $b ) if ( $b['key'] === $key ) $found = $b;
 		if ( ! $found ) return new WP_Error( 'bad_key', 'Respaldo no encontrado', [ 'status' => 404 ] );
-		$ckey    = self::content_key( $id );
+		$area    = $found['area'] ?? 'content';
+		$ckey    = self::key_for( $id, $area );
 		$current = get_post_meta( $id, $ckey, true );
-		self::backup( $id, is_array( $current ) ? $current : [], 'antes de restaurar ' . $key );
+		self::backup( $id, is_array( $current ) ? $current : [], 'antes de restaurar ' . $key, $area );
 		update_post_meta( $id, $ckey, wp_slash( $found['content'] ) );
 		wp_update_post( [ 'ID' => $id ] );
-		self::regenerate_css( $id, $found['content'] );
-		return [ 'ok' => true, 'restored' => $key, 'elements' => count( $found['content'] ) ];
+		self::regenerate_css( $id, $found['content'], $area );
+		return [ 'ok' => true, 'restored' => $key, 'area' => $area, 'elements' => count( $found['content'] ) ];
 	}
 
 	/* ---------- POST /pages ---------- */
@@ -243,11 +283,11 @@ class Lucuma_Bricks_Bridge {
 		return $added;
 	}
 
-	private static function backup( $id, $content, $nota ) {
+	private static function backup( $id, $content, $nota, $area = 'content' ) {
 		$backups = get_post_meta( $id, self::META_BACKUPS, true );
 		if ( ! is_array( $backups ) ) $backups = [];
 		$key = gmdate( 'Ymd-His' );
-		$backups[] = [ 'key' => $key, 'date' => current_time( 'mysql' ), 'nota' => $nota, 'content' => $content ];
+		$backups[] = [ 'key' => $key, 'date' => current_time( 'mysql' ), 'nota' => $nota, 'area' => $area, 'content' => $content ];
 		$backups = array_slice( $backups, - self::MAX_BACKUPS );
 		update_post_meta( $id, self::META_BACKUPS, wp_slash( $backups ) );
 		return $key;
@@ -260,7 +300,7 @@ class Lucuma_Bricks_Bridge {
 	 * los elementos antes, se verifica el resultado y, si queda vacío, se restaura el
 	 * archivo anterior. Devuelve un pequeño informe.
 	 */
-	private static function regenerate_css( $id, $elements ) {
+	private static function regenerate_css( $id, $elements, $area = 'content' ) {
 		$info = [ 'mode' => 'inline', 'status' => 'skipped' ];
 		if ( ! class_exists( '\Bricks\Assets_Files' ) || ! method_exists( '\Bricks\Assets_Files', 'generate_post_css_file' ) ) return $info;
 
@@ -285,7 +325,7 @@ class Lucuma_Bricks_Bridge {
 			}
 		} catch ( \Throwable $t ) { $info['init_error'] = $t->getMessage(); }
 
-		try { \Bricks\Assets_Files::generate_post_css_file( $id, 'content', $elements ); }
+		try { \Bricks\Assets_Files::generate_post_css_file( $id, $area, $elements ); }
 		catch ( \Throwable $t ) { $info['gen_error'] = $t->getMessage(); }
 
 		clearstatcache();

@@ -42,11 +42,17 @@ python3 webs/bricks_push.py --nueva "Título" archivo.json --slug mi-pagina [--p
 | POST | `/lucuma-bricks/v1/pages/{id}/restore` | `{backup: "KEY"}` o vacío para el último |
 | POST | `/lucuma-bricks/v1/pages` | `{title, slug, status, content, globalClasses}` crea la página y la rellena |
 | GET | `/lucuma-bricks/v1/classes` | Clases globales del sitio |
+| GET | `/lucuma-bricks/v1/templates` | Plantillas de Bricks: id, título, tipo y nº de elementos por área (1.0.5) |
+
+**Áreas (desde 1.0.5).** `GET /pages/{id}`, `POST /pages/{id}/content` y `POST /pages/{id}/css` aceptan
+`area`: `content` (por defecto), `header` o `footer`. Así se editan las plantillas de header y footer de
+Bricks, que guardan sus elementos en `_bricks_page_header_2` / `_bricks_page_footer_2`. Los respaldos
+recuerdan su área y `restore` la respeta. Para cambios puntuales en una plantilla usar `regenerate_ids:
+false` (`--keep-ids`) para no alterar los IDs que usa el CSS.
 
 ## Límites conocidos
 
-- Escribe solo el contenido de la página. Header, footer y ajustes de página (`_bricks_page_settings`)
-  no se tocan.
+- Los ajustes de página (`_bricks_page_settings`) y los ajustes de plantilla (condiciones) no se tocan.
 - Si Bricks cambia el nombre de la meta en una versión futura, actualizar `META_CONTENT`.
 - Lo que escribe es exactamente lo que pegarías: el JSON tiene que ser válido para la versión de
   Bricks instalada (hoy 2.3.7).
