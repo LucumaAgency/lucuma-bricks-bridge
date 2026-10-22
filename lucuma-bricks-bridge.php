@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Lucuma Bricks Bridge
- * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración.
- * Version: 1.0.5
+ * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores.
+ * Version: 1.1.0
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,9 +21,23 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
+	const VERSION       = '1.1.0';
+	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
+	const META_TPL_TYPE     = '_bricks_template_type';
+	const META_TPL_SETTINGS = '_bricks_template_settings';
+	const META_TPL_BACKUPS  = '_lucuma_tpl_backups';
+	const OPT_CLASS_BACKUPS = 'lucuma_bricks_classes_backups';
+	const META_NOINDEX      = '_lucuma_noindex';
+	const OPT_PREVIEW       = 'lucuma_bricks_preview';
+	const PREVIEW_ARG       = 'lucuma_preview';
 
 	public static function init() {
 		add_action( 'rest_api_init', [ __CLASS__, 'routes' ] );
+		add_filter( 'wp_robots', [ __CLASS__, 'robots' ] );
+		// Vista previa privada: solo actúa si la URL trae un token válido.
+		add_filter( 'posts_results', [ __CLASS__, 'preview_posts' ], 10, 2 );
+		add_filter( 'bricks/active_templates', [ __CLASS__, 'preview_templates' ], 999, 3 );
+		add_action( 'template_redirect', [ __CLASS__, 'preview_headers' ], 0 );
 	}
 
 	public static function routes() {
@@ -34,7 +48,7 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/health', [
 			'methods' => 'GET', 'permission_callback' => '__return_true',
 			'callback' => function () {
-				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => '1.0.5' ];
+				return [ 'ok' => true, 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'plugin' => self::VERSION ];
 			},
 		] );
 		register_rest_route( self::NS, '/pages/(?P<id>\d+)', [
@@ -61,12 +75,225 @@ class Lucuma_Bricks_Bridge {
 			'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'create_page' ],
 		] );
 		register_rest_route( self::NS, '/templates', [
-			'methods' => 'GET', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'list_templates' ],
+			[ 'methods' => 'GET', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'list_templates' ] ],
+			[ 'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'create_template' ] ],
 		] );
+		register_rest_route( self::NS, '/templates/(?P<id>\d+)/settings', [
+			[ 'methods' => 'GET', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'get_template_settings' ] ],
+			[ 'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'set_template_settings' ] ],
+		] );
+		register_rest_route( self::NS, '/templates/(?P<id>\d+)/settings/restore', [
+			'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'restore_template_settings' ],
+		] );
+		$admin = function () { return current_user_can( 'manage_options' ); };
 		register_rest_route( self::NS, '/classes', [
-			'methods' => 'GET', 'permission_callback' => $perm,
-			'callback' => function () { return get_option( self::OPT_CLASSES, [] ); },
+			[ 'methods' => 'GET', 'permission_callback' => $perm, 'callback' => function () { return get_option( self::OPT_CLASSES, [] ); } ],
+			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'upsert_classes' ] ],
 		] );
+		register_rest_route( self::NS, '/pages/(?P<id>\d+)/noindex', [
+			'methods' => 'POST', 'permission_callback' => $perm, 'callback' => [ __CLASS__, 'set_noindex' ],
+		] );
+		register_rest_route( self::NS, '/preview', [
+			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'create_preview' ] ],
+			[ 'methods' => 'DELETE', 'permission_callback' => $admin, 'callback' => function () {
+				delete_option( self::OPT_PREVIEW ); return [ 'ok' => true, 'revoked' => true ];
+			} ],
+		] );
+	}
+
+	/* ---------- Plantillas: crear, tipo y condiciones ---------- */
+
+	/** POST /templates {title, type, status} crea una plantilla vacía de Bricks. */
+	public static function create_template( $req ) {
+		$b = $req->get_json_params();
+		$title = sanitize_text_field( $b['title'] ?? '' );
+		$type  = sanitize_key( $b['type'] ?? '' );
+		if ( ! $title || ! $type ) return new WP_Error( 'bad_args', 'Faltan "title" y "type"', [ 'status' => 400 ] );
+		$id = wp_insert_post( [ 'post_type' => 'bricks_template', 'post_title' => $title,
+			'post_status' => in_array( $b['status'] ?? 'publish', [ 'publish', 'draft' ], true ) ? ( $b['status'] ?? 'publish' ) : 'publish' ], true );
+		if ( is_wp_error( $id ) ) return $id;
+		update_post_meta( $id, self::META_TPL_TYPE, $type );
+		update_post_meta( $id, self::META_MODE, 'bricks' );
+		return [ 'ok' => true, 'id' => $id, 'title' => $title, 'type' => $type ];
+	}
+
+	public static function get_template_settings( $req ) {
+		$id = (int) $req['id'];
+		$p  = get_post( $id );
+		if ( ! $p || $p->post_type !== 'bricks_template' ) return new WP_Error( 'not_found', 'Plantilla no encontrada', [ 'status' => 404 ] );
+		$s = get_post_meta( $id, self::META_TPL_SETTINGS, true );
+		$bk = get_post_meta( $id, self::META_TPL_BACKUPS, true );
+		return [ 'id' => $id, 'title' => $p->post_title, 'type' => get_post_meta( $id, self::META_TPL_TYPE, true ),
+			'settings' => is_array( $s ) ? $s : new stdClass(),
+			'backups' => is_array( $bk ) ? array_map( function ( $x ) { return [ 'key' => $x['key'], 'date' => $x['date'], 'nota' => $x['nota'] ]; }, $bk ) : [] ];
+	}
+
+	/**
+	 * POST /templates/{id}/settings
+	 * {type?, conditions?: [...] (reemplaza templateConditions; [] las quita), settings?: {...} (reemplaza todo), nota?}
+	 * Guarda un respaldo del tipo y los ajustes anteriores.
+	 */
+	public static function set_template_settings( $req ) {
+		$id = (int) $req['id'];
+		$p  = get_post( $id );
+		if ( ! $p || $p->post_type !== 'bricks_template' ) return new WP_Error( 'not_found', 'Plantilla no encontrada', [ 'status' => 404 ] );
+		$b = $req->get_json_params();
+		if ( ! is_array( $b ) ) return new WP_Error( 'bad_json', 'El body debe ser JSON', [ 'status' => 400 ] );
+		$old_type = get_post_meta( $id, self::META_TPL_TYPE, true );
+		$old      = get_post_meta( $id, self::META_TPL_SETTINGS, true );
+		$old      = is_array( $old ) ? $old : [];
+		$new      = $old;
+		if ( isset( $b['settings'] ) ) {
+			if ( ! is_array( $b['settings'] ) ) return new WP_Error( 'bad_settings', '"settings" debe ser un objeto', [ 'status' => 400 ] );
+			$new = $b['settings'];
+		}
+		if ( array_key_exists( 'conditions', $b ) ) {
+			if ( ! is_array( $b['conditions'] ) ) return new WP_Error( 'bad_conditions', '"conditions" debe ser una lista', [ 'status' => 400 ] );
+			if ( $b['conditions'] ) $new['templateConditions'] = array_values( $b['conditions'] );
+			else unset( $new['templateConditions'] );
+		}
+		$key = self::tpl_backup( $id, $old_type, $old, sanitize_text_field( $b['nota'] ?? 'antes de cambiar ajustes' ) );
+		if ( isset( $b['type'] ) ) update_post_meta( $id, self::META_TPL_TYPE, sanitize_key( $b['type'] ) );
+		if ( $new ) update_post_meta( $id, self::META_TPL_SETTINGS, wp_slash( $new ) );
+		else delete_post_meta( $id, self::META_TPL_SETTINGS );
+		wp_update_post( [ 'ID' => $id ] );
+		self::flush_bricks_caches();
+		return [ 'ok' => true, 'id' => $id, 'type' => get_post_meta( $id, self::META_TPL_TYPE, true ),
+			'settings' => $new ?: new stdClass(), 'backup' => $key ];
+	}
+
+	public static function restore_template_settings( $req ) {
+		$id = (int) $req['id'];
+		$bk = get_post_meta( $id, self::META_TPL_BACKUPS, true );
+		if ( ! is_array( $bk ) || ! $bk ) return new WP_Error( 'no_backups', 'Sin respaldos', [ 'status' => 404 ] );
+		$b = $req->get_json_params();
+		$want = is_array( $b ) && ! empty( $b['backup'] ) ? $b['backup'] : end( $bk )['key'];
+		$found = null;
+		foreach ( $bk as $x ) if ( $x['key'] === $want ) $found = $x;
+		if ( ! $found ) return new WP_Error( 'bad_key', 'Respaldo no encontrado', [ 'status' => 404 ] );
+		$cur = get_post_meta( $id, self::META_TPL_SETTINGS, true );
+		self::tpl_backup( $id, get_post_meta( $id, self::META_TPL_TYPE, true ), is_array( $cur ) ? $cur : [], 'antes de restaurar ' . $want );
+		if ( $found['type'] !== '' ) update_post_meta( $id, self::META_TPL_TYPE, $found['type'] );
+		if ( $found['settings'] ) update_post_meta( $id, self::META_TPL_SETTINGS, wp_slash( $found['settings'] ) );
+		else delete_post_meta( $id, self::META_TPL_SETTINGS );
+		wp_update_post( [ 'ID' => $id ] );
+		self::flush_bricks_caches();
+		return [ 'ok' => true, 'restored' => $want ];
+	}
+
+	private static function tpl_backup( $id, $type, $settings, $nota ) {
+		$bk = get_post_meta( $id, self::META_TPL_BACKUPS, true );
+		if ( ! is_array( $bk ) ) $bk = [];
+		$key = gmdate( 'Ymd-His' ) . '-' . substr( md5( wp_rand() ), 0, 4 );
+		$bk[] = [ 'key' => $key, 'date' => current_time( 'mysql' ), 'nota' => $nota, 'type' => (string) $type, 'settings' => $settings ];
+		update_post_meta( $id, self::META_TPL_BACKUPS, wp_slash( array_slice( $bk, -10 ) ) );
+		return $key;
+	}
+
+	/** Bricks guarda en caché qué plantillas aplican; se limpia tras cambiar condiciones. */
+	private static function flush_bricks_caches() {
+		delete_transient( 'bricks_template_conditions' );
+		if ( function_exists( 'wp_cache_flush' ) ) wp_cache_flush();
+	}
+
+	/* ---------- Clases globales (actualizar, no solo añadir) ---------- */
+
+	/** POST /classes {classes:[{id,name,settings}], nota?} reemplaza por id las existentes y añade las nuevas. */
+	public static function upsert_classes( $req ) {
+		$b = $req->get_json_params();
+		$in = is_array( $b ) && isset( $b['classes'] ) && is_array( $b['classes'] ) ? $b['classes'] : null;
+		if ( $in === null ) return new WP_Error( 'no_classes', 'Falta "classes"', [ 'status' => 400 ] );
+		$opt = get_option( self::OPT_CLASSES, [] );
+		if ( ! is_array( $opt ) ) $opt = [];
+		$bk = get_option( self::OPT_CLASS_BACKUPS, [] );
+		if ( ! is_array( $bk ) ) $bk = [];
+		$bk[] = [ 'date' => current_time( 'mysql' ), 'nota' => sanitize_text_field( $b['nota'] ?? '' ), 'classes' => $opt ];
+		update_option( self::OPT_CLASS_BACKUPS, array_slice( $bk, -5 ), false );
+		$pos = [];
+		foreach ( $opt as $i => $c ) if ( isset( $c['id'] ) ) $pos[ $c['id'] ] = $i;
+		$added = 0; $updated = 0;
+		foreach ( $in as $c ) {
+			if ( empty( $c['id'] ) || empty( $c['name'] ) ) continue;
+			if ( isset( $pos[ $c['id'] ] ) ) { $opt[ $pos[ $c['id'] ] ] = $c; $updated++; }
+			else { $opt[] = $c; $pos[ $c['id'] ] = count( $opt ) - 1; $added++; }
+		}
+		update_option( self::OPT_CLASSES, $opt );
+		return [ 'ok' => true, 'added' => $added, 'updated' => $updated, 'total' => count( $opt ) ];
+	}
+
+	/* ---------- Noindex por página ---------- */
+
+	public static function set_noindex( $req ) {
+		$id = (int) $req['id'];
+		if ( ! get_post( $id ) ) return new WP_Error( 'not_found', 'Página no encontrada', [ 'status' => 404 ] );
+		$b = $req->get_json_params();
+		$on = ! is_array( $b ) || ! array_key_exists( 'noindex', $b ) || (bool) $b['noindex'];
+		if ( $on ) update_post_meta( $id, self::META_NOINDEX, 1 ); else delete_post_meta( $id, self::META_NOINDEX );
+		return [ 'ok' => true, 'id' => $id, 'noindex' => $on ];
+	}
+
+	public static function robots( $robots ) {
+		$id = is_singular() ? get_queried_object_id() : 0;
+		if ( ( $id && get_post_meta( $id, self::META_NOINDEX, true ) ) || self::preview_valid() ) {
+			$robots['noindex'] = true; $robots['nofollow'] = true;
+			unset( $robots['index'], $robots['follow'], $robots['max-image-preview'] );
+		}
+		return $robots;
+	}
+
+	/* ---------- Vista previa privada de borradores ---------- */
+
+	/**
+	 * POST /preview {hours?: 24} crea un token (se guarda solo su hash) válido por N horas (máx. 168).
+	 * Con ?lucuma_preview=TOKEN se ve cualquier borrador (por ?page_id= o ?p=) y se pueden forzar
+	 * plantillas de Bricks: &lb_header=ID &lb_footer=ID &lb_content=ID (o cualquier clave lb_<área>).
+	 * La respuesta siempre lleva noindex y no se guarda en caché. DELETE /preview lo revoca.
+	 */
+	public static function create_preview( $req ) {
+		$b = $req->get_json_params();
+		$h = max( 1, min( 168, (int) ( is_array( $b ) && isset( $b['hours'] ) ? $b['hours'] : 24 ) ) );
+		$token = wp_generate_password( 32, false, false );
+		$exp = time() + $h * HOUR_IN_SECONDS;
+		update_option( self::OPT_PREVIEW, [ 'hash' => hash( 'sha256', $token ), 'expires' => $exp ], false );
+		return [ 'ok' => true, 'token' => $token, 'expires' => gmdate( 'c', $exp ), 'arg' => self::PREVIEW_ARG ];
+	}
+
+	private static function preview_valid() {
+		static $valid = null;
+		if ( $valid !== null ) return $valid;
+		$valid = false;
+		if ( empty( $_GET[ self::PREVIEW_ARG ] ) ) return $valid;
+		$o = get_option( self::OPT_PREVIEW );
+		if ( ! is_array( $o ) || empty( $o['hash'] ) || time() > (int) $o['expires'] ) return $valid;
+		$t = sanitize_text_field( wp_unslash( $_GET[ self::PREVIEW_ARG ] ) );
+		$valid = hash_equals( $o['hash'], hash( 'sha256', $t ) );
+		return $valid;
+	}
+
+	/** Deja ver el borrador pedido en la consulta principal (como hace "Public Post Preview"). */
+	public static function preview_posts( $posts, $query ) {
+		if ( is_admin() || ! $query->is_main_query() || count( $posts ) !== 1 || ! self::preview_valid() ) return $posts;
+		if ( in_array( $posts[0]->post_status, [ 'draft', 'pending', 'future', 'private' ], true ) ) $posts[0]->post_status = 'publish';
+		return $posts;
+	}
+
+	/** Con token válido, ?lb_header=ID, ?lb_footer=ID, ?lb_content=ID… sustituyen las plantillas activas. */
+	public static function preview_templates( $active, $post_id = 0, $content_type = '' ) {
+		if ( ! is_array( $active ) || ! self::preview_valid() ) return $active;
+		foreach ( $_GET as $k => $v ) {
+			if ( strpos( $k, 'lb_' ) !== 0 ) continue;
+			$area = sanitize_key( substr( $k, 3 ) );
+			$tid  = (int) $v;
+			if ( $area && $tid && get_post_type( $tid ) === 'bricks_template' ) $active[ $area ] = $tid;
+		}
+		return $active;
+	}
+
+	public static function preview_headers() {
+		if ( ! self::preview_valid() ) return;
+		if ( ! defined( 'DONOTCACHEPAGE' ) ) define( 'DONOTCACHEPAGE', true );
+		nocache_headers();
+		header( 'X-Robots-Tag: noindex, nofollow', true );
 	}
 
 	/** Clave donde vive el contenido Bricks de este post (la nueva si hay algo, si no la antigua). */
