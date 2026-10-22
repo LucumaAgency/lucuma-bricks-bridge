@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Lucuma Bricks Bridge
- * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores.
- * Version: 1.1.0
+ * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa.
+ * Version: 1.2.0
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.1.0';
+	const VERSION       = '1.2.0';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -30,6 +30,7 @@ class Lucuma_Bricks_Bridge {
 	const META_NOINDEX      = '_lucuma_noindex';
 	const OPT_PREVIEW       = 'lucuma_bricks_preview';
 	const PREVIEW_ARG       = 'lucuma_preview';
+	const OPT_PREVIEW_MAP   = 'lucuma_bricks_preview_map';
 
 	public static function init() {
 		add_action( 'rest_api_init', [ __CLASS__, 'routes' ] );
@@ -38,6 +39,7 @@ class Lucuma_Bricks_Bridge {
 		add_filter( 'posts_results', [ __CLASS__, 'preview_posts' ], 10, 2 );
 		add_filter( 'bricks/active_templates', [ __CLASS__, 'preview_templates' ], 999, 3 );
 		add_action( 'template_redirect', [ __CLASS__, 'preview_headers' ], 0 );
+		add_action( 'wp_footer', [ __CLASS__, 'preview_links_script' ], 999 );
 	}
 
 	public static function routes() {
@@ -98,6 +100,12 @@ class Lucuma_Bricks_Bridge {
 			[ 'methods' => 'DELETE', 'permission_callback' => $admin, 'callback' => function () {
 				delete_option( self::OPT_PREVIEW ); return [ 'ok' => true, 'revoked' => true ];
 			} ],
+		] );
+		register_rest_route( self::NS, '/preview/map', [
+			[ 'methods' => 'GET', 'permission_callback' => $admin, 'callback' => function () {
+				return [ 'ok' => true, 'rules' => get_option( self::OPT_PREVIEW_MAP, [] ) ];
+			} ],
+			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'set_preview_map' ] ],
 		] );
 	}
 
@@ -287,6 +295,60 @@ class Lucuma_Bricks_Bridge {
 			if ( $area && $tid && get_post_type( $tid ) === 'bricks_template' ) $active[ $area ] = $tid;
 		}
 		return $active;
+	}
+
+	/**
+	 * POST /preview/map {rules:[...]} guarda cómo se reescriben los enlaces internos durante la vista previa.
+	 * Cada regla: {path:"/nosotros/"} (exacta) o {prefix:"/proyecto/"}; y opcionalmente to:"/?page_id=1228"
+	 * (nueva ruta, puede llevar query) y add:{lb_header:1221,…} (parámetros extra). Con [] se borra.
+	 */
+	public static function set_preview_map( $req ) {
+		$b = $req->get_json_params();
+		$rules = [];
+		foreach ( ( is_array( $b ) && isset( $b['rules'] ) && is_array( $b['rules'] ) ) ? $b['rules'] : [] as $r ) {
+			if ( ! is_array( $r ) ) continue;
+			$o = [];
+			if ( ! empty( $r['path'] ) ) $o['path'] = '/' . trim( sanitize_text_field( $r['path'] ), '/' );
+			elseif ( ! empty( $r['prefix'] ) ) $o['prefix'] = '/' . ltrim( sanitize_text_field( $r['prefix'] ), '/' );
+			else continue;
+			if ( ! empty( $r['to'] ) ) $o['to'] = sanitize_text_field( $r['to'] );
+			if ( ! empty( $r['add'] ) && is_array( $r['add'] ) ) {
+				foreach ( $r['add'] as $k => $v ) $o['add'][ sanitize_key( $k ) ] = sanitize_text_field( (string) $v );
+			}
+			$rules[] = $o;
+		}
+		update_option( self::OPT_PREVIEW_MAP, $rules, false );
+		return [ 'ok' => true, 'rules' => $rules ];
+	}
+
+	/**
+	 * Solo con token válido: reescribe los enlaces internos de la página para que la navegación siga
+	 * dentro de la vista previa (aplica el mapa y añade el token). Sin token no imprime nada.
+	 */
+	public static function preview_links_script() {
+		if ( ! self::preview_valid() ) return;
+		$cfg = [
+			'arg'   => self::PREVIEW_ARG,
+			'token' => sanitize_text_field( wp_unslash( $_GET[ self::PREVIEW_ARG ] ) ),
+			'host'  => wp_parse_url( home_url(), PHP_URL_HOST ),
+			'rules' => array_values( (array) get_option( self::OPT_PREVIEW_MAP, [] ) ),
+		];
+		?>
+<script id="lucuma-preview-links">(function(c){
+var norm=function(p){p=p.replace(/\/+$/,'');return p||'/';};
+function fix(a){
+ if(a.dataset.lbDone)return; var h=a.getAttribute('href'); if(!h||h.charAt(0)==='#'||/^(mailto|tel|javascript|data):/i.test(h))return;
+ var u; try{u=new URL(h,location.href);}catch(e){return;} if(u.hostname!==c.host||/\/wp-(admin|login|json)|\.(pdf|jpe?g|png|webp|zip)$/i.test(u.pathname))return;
+ var p=norm(u.pathname);
+ for(var i=0;i<c.rules.length;i++){var r=c.rules[i];
+  if(r.path?p===norm(r.path):(r.prefix&&u.pathname.indexOf(r.prefix)===0&&u.pathname.length>r.prefix.length)){
+   if(r.to){var t=new URL(r.to,location.origin);u.pathname=t.pathname;t.searchParams.forEach(function(v,k){u.searchParams.set(k,v);});}
+   if(r.add)for(var k in r.add)u.searchParams.set(k,r.add[k]); break;}}
+ u.searchParams.set(c.arg,c.token); a.setAttribute('href',u.toString()); a.dataset.lbDone='1';}
+function all(){document.querySelectorAll('a[href]').forEach(fix);}
+all(); new MutationObserver(all).observe(document.body,{childList:true,subtree:true});
+})(<?php echo wp_json_encode( $cfg ); ?>);</script>
+		<?php
 	}
 
 	public static function preview_headers() {

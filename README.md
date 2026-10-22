@@ -50,12 +50,20 @@ python3 webs/bricks_push.py --nueva "Título" archivo.json --slug mi-pagina [--p
 | POST | `/lucuma-bricks/v1/classes` | `{classes:[...], nota?}` actualiza por id y añade las nuevas; respaldo en opción (1.1.0, admin) |
 | POST | `/lucuma-bricks/v1/pages/{id}/noindex` | `{noindex: true/false}` marca la página como noindex (1.1.0) |
 | POST/DELETE | `/lucuma-bricks/v1/preview` | Crea (`{hours}`) o revoca el token de vista previa privada (1.1.0, admin) |
+| GET/POST | `/lucuma-bricks/v1/preview/map` | Lee o guarda (`{rules:[...]}`) el mapa de enlaces de la vista previa (1.2.0, admin) |
 
 **Vista previa privada (1.1.0).** Con el token, `?lucuma_preview=TOKEN` deja ver un borrador
 (`/?page_id=ID&lucuma_preview=TOKEN`) sin sesión, y `&lb_header=ID&lb_footer=ID&lb_content=ID` fuerza
 plantillas de Bricks en esa visita (filtro `bricks/active_templates`) para probar plantillas sin
 condiciones. Solo se guarda el hash del token, caduca (máx. 7 días), la respuesta va con noindex y sin
 caché. Sin el token exacto el borrador sigue siendo invisible.
+
+**Navegar dentro de la vista previa (1.2.0).** Con token válido se imprime en el pie un script que
+reescribe los enlaces internos: añade el token y aplica el mapa guardado con `POST /preview/map`. Cada
+regla es `{path: "/nosotros/"}` (exacta) o `{prefix: "/proyecto/"}` (cualquier ruta debajo), con
+`to: "/?page_id=1228"` (otra ruta) y/o `add: {lb_header: 1221, …}` (parámetros). Gana la primera regla
+que coincide; `{prefix: "/"}` al final sirve de comodín. Así los enlaces del sitio apuntan a las URLs
+finales y, mientras se revisa, llevan a los borradores. Sin token no se imprime nada.
 
 **Áreas (desde 1.0.5).** `GET /pages/{id}`, `POST /pages/{id}/content` y `POST /pages/{id}/css` aceptan
 `area`: `content` (por defecto), `header` o `footer`. Así se editan las plantillas de header y footer de
