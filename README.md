@@ -71,6 +71,12 @@ Bricks, que guardan sus elementos en `_bricks_page_header_2` / `_bricks_page_foo
 recuerdan su área y `restore` la respeta. Para cambios puntuales en una plantilla usar `regenerate_ids:
 false` (`--keep-ids`) para no alterar los IDs que usa el CSS.
 
+**Medios (desde 1.3.0).** `POST /media/{id}/replace` (multipart, campo `file`, mismo formato que el
+original) cambia el archivo de una imagen sin cambiar su ID, así que todo lo que la usa (ACF, Bricks) sigue
+igual. Guarda el original una sola vez como `<nombre>-original.<ext>` junto al archivo y regenera los
+tamaños de WordPress. `POST /media/{id}/restore` vuelve a poner el original. Requiere `manage_options`.
+Pensado para imágenes subidas enormes (p. ej. planos de 8430 px) a las que WordPress no pudo crear tamaños.
+
 ## Límites conocidos
 
 - Los ajustes de página (`_bricks_page_settings`) no se tocan. Las condiciones de plantilla se guardan en

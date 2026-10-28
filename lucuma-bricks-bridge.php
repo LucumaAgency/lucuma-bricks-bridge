@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Lucuma Bricks Bridge
- * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa.
- * Version: 1.2.0
+ * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID) guardando el original.
+ * Version: 1.3.0
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.2.0';
+	const VERSION       = '1.3.0';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -31,6 +31,7 @@ class Lucuma_Bricks_Bridge {
 	const OPT_PREVIEW       = 'lucuma_bricks_preview';
 	const PREVIEW_ARG       = 'lucuma_preview';
 	const OPT_PREVIEW_MAP   = 'lucuma_bricks_preview_map';
+	const META_MEDIA_ORIG   = '_lucuma_original_file';
 
 	public static function init() {
 		add_action( 'rest_api_init', [ __CLASS__, 'routes' ] );
@@ -107,6 +108,80 @@ class Lucuma_Bricks_Bridge {
 			} ],
 			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'set_preview_map' ] ],
 		] );
+		$media = function () { return current_user_can( 'upload_files' ) && current_user_can( 'manage_options' ); };
+		register_rest_route( self::NS, '/media/(?P<id>\d+)/replace', [
+			'methods' => 'POST', 'permission_callback' => $media, 'callback' => [ __CLASS__, 'media_replace' ],
+		] );
+		register_rest_route( self::NS, '/media/(?P<id>\d+)/restore', [
+			'methods' => 'POST', 'permission_callback' => $media, 'callback' => [ __CLASS__, 'media_restore' ],
+		] );
+	}
+
+	/* ---------- Medios: reemplazar el archivo de una imagen sin cambiar su ID ---------- */
+
+	/**
+	 * POST /media/{id}/replace (multipart, campo "file"). Mismo formato que el original.
+	 * El original se guarda junto al archivo como <nombre>-original.<ext> (una sola vez) y se regeneran
+	 * los tamaños. Pensado para imágenes subidas enormes a las que WordPress no pudo generar tamaños.
+	 */
+	public static function media_replace( $req ) {
+		$id   = (int) $req['id'];
+		$path = get_attached_file( $id );
+		if ( ! $path || ! file_exists( $path ) || ! wp_attachment_is_image( $id ) ) {
+			return new WP_Error( 'no_image', 'No existe la imagen', [ 'status' => 404 ] );
+		}
+		$files = $req->get_file_params();
+		if ( empty( $files['file']['tmp_name'] ) || ! is_uploaded_file( $files['file']['tmp_name'] ) ) {
+			return new WP_Error( 'no_file', 'Falta el archivo (campo file)', [ 'status' => 400 ] );
+		}
+		$ext = strtolower( pathinfo( $path, PATHINFO_EXTENSION ) );
+		$chk = wp_check_filetype_and_ext( $files['file']['tmp_name'], 'x.' . $ext );
+		$new = @getimagesize( $files['file']['tmp_name'] );
+		if ( ! $new || empty( $chk['type'] ) || $new['mime'] !== $chk['type'] ) {
+			return new WP_Error( 'bad_type', 'El archivo debe ser una imagen .' . $ext, [ 'status' => 400 ] );
+		}
+		$orig = get_post_meta( $id, self::META_MEDIA_ORIG, true );
+		if ( ! $orig ) {
+			$orig = preg_replace( '/\.' . preg_quote( $ext, '/' ) . '$/i', '-original.' . $ext, $path );
+			if ( ! copy( $path, $orig ) ) return new WP_Error( 'backup', 'No se pudo guardar el original', [ 'status' => 500 ] );
+			update_post_meta( $id, self::META_MEDIA_ORIG, $orig );
+		}
+		self::media_delete_sizes( $id, $path );
+		if ( ! move_uploaded_file( $files['file']['tmp_name'], $path ) ) {
+			return new WP_Error( 'move', 'No se pudo escribir el archivo', [ 'status' => 500 ] );
+		}
+		return self::media_regenerate( $id, $path, $orig );
+	}
+
+	/** POST /media/{id}/restore: vuelve a poner el original guardado por /replace. */
+	public static function media_restore( $req ) {
+		$id   = (int) $req['id'];
+		$path = get_attached_file( $id );
+		$orig = get_post_meta( $id, self::META_MEDIA_ORIG, true );
+		if ( ! $orig || ! file_exists( $orig ) ) return new WP_Error( 'no_backup', 'No hay original guardado', [ 'status' => 404 ] );
+		self::media_delete_sizes( $id, $path );
+		if ( ! copy( $orig, $path ) ) return new WP_Error( 'copy', 'No se pudo restaurar', [ 'status' => 500 ] );
+		return self::media_regenerate( $id, $path, $orig );
+	}
+
+	private static function media_delete_sizes( $id, $path ) {
+		$meta = wp_get_attachment_metadata( $id );
+		if ( empty( $meta['sizes'] ) ) return;
+		$dir = dirname( $path );
+		foreach ( $meta['sizes'] as $s ) {
+			if ( ! empty( $s['file'] ) && file_exists( $dir . '/' . $s['file'] ) ) @unlink( $dir . '/' . $s['file'] );
+		}
+	}
+
+	private static function media_regenerate( $id, $path, $orig ) {
+		require_once ABSPATH . 'wp-admin/includes/image.php';
+		clearstatcache();
+		$meta = wp_generate_attachment_metadata( $id, $path );
+		wp_update_attachment_metadata( $id, $meta );
+		clean_post_cache( $id );
+		return [ 'ok' => true, 'id' => $id, 'width' => $meta['width'] ?? null, 'height' => $meta['height'] ?? null,
+			'filesize' => $meta['filesize'] ?? filesize( $path ), 'sizes' => array_keys( $meta['sizes'] ?? [] ),
+			'original' => basename( $orig ) ];
 	}
 
 	/* ---------- Plantillas: crear, tipo y condiciones ---------- */
