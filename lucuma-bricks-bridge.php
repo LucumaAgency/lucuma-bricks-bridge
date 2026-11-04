@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID)  guardando el original. Desde 1.4.0: diagnóstico de correo (envío de prueba con registro) y lectura de los ajustes que usa la acción Email de los formularios Bricks.
- * Version: 1.4.0
+ * Version: 1.4.1
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.4.0';
+	const VERSION       = '1.4.1';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -766,6 +766,12 @@ all(); new MutationObserver(all).observe(document.body,{childList:true,subtree:t
 				$rows = $wpdb->get_results( "SELECT * FROM `$t` ORDER BY id DESC LIMIT $limit", ARRAY_A );
 				foreach ( $rows as &$r ) {
 					unset( $r['original_message'] );
+					// La conversación SMTP incluye usuario y contraseña en base64 tras AUTH: se ocultan.
+					if ( ! empty( $r['session_transcript'] ) ) {
+						$r['session_transcript'] = preg_replace(
+							[ '/(334 VXNlcm5hbWU6\s*\R)\S+/', '/(334 UGFzc3dvcmQ6\s*\R)\S+/', '/(AUTH PLAIN )\S+/' ],
+							'$1(oculto)', $r['session_transcript'] );
+					}
 				}
 				return [ 'table' => $t, 'rows' => $rows ];
 			}
