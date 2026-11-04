@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Lucuma Bricks Bridge
- * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID) guardando el original.
- * Version: 1.3.0
+ * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID)  guardando el original. Desde 1.4.0: diagnóstico de correo (envío de prueba con registro) y lectura de los ajustes que usa la acción Email de los formularios Bricks.
+ * Version: 1.4.0
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.3.0';
+	const VERSION       = '1.4.0';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -114,6 +114,20 @@ class Lucuma_Bricks_Bridge {
 		] );
 		register_rest_route( self::NS, '/media/(?P<id>\d+)/restore', [
 			'methods' => 'POST', 'permission_callback' => $media, 'callback' => [ __CLASS__, 'media_restore' ],
+		] );
+		// 1.4.0: diagnóstico de correo, solo administradores.
+		$admin = function () { return current_user_can( 'manage_options' ); };
+		register_rest_route( self::NS, '/mail/config', [
+			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'mail_config' ],
+		] );
+		register_rest_route( self::NS, '/mail/test', [
+			'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'mail_test' ],
+		] );
+		register_rest_route( self::NS, '/mail/log', [
+			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'mail_log' ],
+		] );
+		register_rest_route( self::NS, '/forms/email-source', [
+			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'form_email_source' ],
 		] );
 	}
 
@@ -711,5 +725,123 @@ all(); new MutationObserver(all).observe(document.body,{childList:true,subtree:t
 		if ( function_exists( 'wp_cache_flush' ) ) wp_cache_flush();
 		return $info;
 	}
+
+	/* ===================== 1.4.0 · Diagnóstico de correo ===================== */
+
+	/** Quita contraseñas, tokens y claves de un arreglo de opciones. */
+	private static function scrub( $v ) {
+		if ( ! is_array( $v ) ) return $v;
+		$out = [];
+		foreach ( $v as $k => $x ) {
+			if ( preg_match( '/pass|token|secret|key|auth_code|refresh/i', (string) $k ) ) {
+				$out[ $k ] = ( $x === '' || $x === null ) ? '' : '(oculto, ' . strlen( is_scalar( $x ) ? (string) $x : wp_json_encode( $x ) ) . ' caracteres)';
+			} else {
+				$out[ $k ] = is_array( $x ) ? self::scrub( $x ) : $x;
+			}
+		}
+		return $out;
+	}
+
+	/** Qué función wp_mail está activa y la configuración de Post SMTP (sin contraseñas). */
+	public static function mail_config() {
+		$where = null;
+		if ( function_exists( 'wp_mail' ) ) {
+			$r = new ReflectionFunction( 'wp_mail' );
+			$where = str_replace( ABSPATH, '', $r->getFileName() ) . ':' . $r->getStartLine();
+		}
+		return [
+			'wp_mail_defined_in' => $where,
+			'admin_email'        => get_option( 'admin_email' ),
+			'postman_options'    => self::scrub( get_option( 'postman_options', null ) ),
+			'bricks_version'     => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null,
+		];
+	}
+
+	/** Últimas filas del registro de Post SMTP (tabla de 3.x/4.x o entradas antiguas). */
+	private static function postsmtp_rows( $limit = 5 ) {
+		global $wpdb;
+		$limit = max( 1, min( 50, (int) $limit ) );
+		foreach ( [ $wpdb->prefix . 'post_smtp_logs', $wpdb->prefix . 'postman_logs' ] as $t ) {
+			if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $t ) ) === $t ) {
+				$rows = $wpdb->get_results( "SELECT * FROM `$t` ORDER BY id DESC LIMIT $limit", ARRAY_A );
+				foreach ( $rows as &$r ) {
+					unset( $r['original_message'] );
+				}
+				return [ 'table' => $t, 'rows' => $rows ];
+			}
+		}
+		$posts = get_posts( [ 'post_type' => 'postman_sent_mail', 'numberposts' => $limit, 'post_status' => 'any' ] );
+		$rows = [];
+		foreach ( $posts as $p ) {
+			$m = get_post_meta( $p->ID );
+			$rows[] = [ 'id' => $p->ID, 'date' => $p->post_date, 'subject' => $p->post_title,
+				'meta' => array_map( function ( $x ) { return is_array( $x ) ? $x[0] : $x; }, $m ) ];
+		}
+		return [ 'table' => 'postman_sent_mail', 'rows' => $rows ];
+	}
+
+	public static function mail_log( $req ) {
+		return self::postsmtp_rows( $req->get_param( 'limit' ) ?: 5 );
+	}
+
+	/**
+	 * Envía un correo de prueba por wp_mail (el mismo camino que los formularios) y devuelve
+	 * el resultado, el error de wp_mail_failed y la conversación SMTP si PHPMailer la expone.
+	 * Body: {to, subject?, from?, reply_to?}
+	 */
+	public static function mail_test( $req ) {
+		$to = sanitize_email( (string) $req->get_param( 'to' ) );
+		if ( ! $to ) return new WP_Error( 'bad_to', 'Falta un destinatario válido (to).', [ 'status' => 400 ] );
+		$subject = (string) ( $req->get_param( 'subject' ) ?: 'Prueba Lucuma Bricks Bridge ' . current_time( 'Y-m-d H:i:s' ) );
+		$headers = [];
+		if ( $f = sanitize_email( (string) $req->get_param( 'from' ) ) ) $headers[] = 'From: Proba <' . $f . '>';
+		if ( $r = sanitize_email( (string) $req->get_param( 'reply_to' ) ) ) $headers[] = 'Reply-To: ' . $r;
+
+		$debug = [];
+		$error = null;
+		$init = function ( $phpmailer ) use ( &$debug ) {
+			$phpmailer->SMTPDebug   = 3;
+			$phpmailer->Debugoutput = function ( $str ) use ( &$debug ) { $debug[] = rtrim( $str ); };
+		};
+		$fail = function ( $e ) use ( &$error ) { $error = [ 'message' => $e->get_error_message(), 'data' => $e->get_error_data() ]; };
+		add_action( 'phpmailer_init', $init, 9999 );
+		add_action( 'wp_mail_failed', $fail );
+		$ok = wp_mail( $to, $subject, "Correo de prueba enviado por Lucuma Bricks Bridge (diagnóstico).\nSitio: " . home_url() . "\nHora: " . current_time( 'mysql' ), $headers );
+		remove_action( 'phpmailer_init', $init, 9999 );
+		remove_action( 'wp_mail_failed', $fail );
+
+		// Sin la contraseña en la conversación (AUTH en base64).
+		$debug = array_map( function ( $l ) {
+			return preg_replace( '/^(CLIENT -> SERVER: )(?!EHLO|STARTTLS|MAIL|RCPT|DATA|QUIT|AUTH LOGIN\s*$)([A-Za-z0-9+\/=]{8,})\s*$/', '$1(oculto)', preg_replace( '/(AUTH PLAIN )\S+/', '$1(oculto)', $l ) );
+		}, $debug );
+		return [ 'sent' => (bool) $ok, 'to' => $to, 'subject' => $subject, 'wp_mail_failed' => $error,
+			'smtp_debug' => $debug, 'postsmtp_last' => self::postsmtp_rows( 1 ) ];
+	}
+
+	/** Busca en el código de Bricks qué ajustes lee la acción Email (incluida la de confirmación). */
+	public static function form_email_source() {
+		$base = get_template_directory();
+		if ( ! defined( 'BRICKS_VERSION' ) ) return new WP_Error( 'no_bricks', 'Bricks no está activo.', [ 'status' => 400 ] );
+		$files = [];
+		foreach ( [ 'includes/integrations/form/actions/email.php', 'includes/integrations/form/init.php',
+		            'includes/integrations/form/base.php' ] as $rel ) {
+			$f = $base . '/' . $rel;
+			if ( ! is_readable( $f ) ) continue;
+			$lines = file( $f );
+			$keys = [];
+			$hits = [];
+			foreach ( $lines as $i => $l ) {
+				if ( preg_match_all( '/\$(?:form_)?settings\[\s*[\'"]([A-Za-z0-9_]+)[\'"]\s*\]/', $l, $m ) ) {
+					foreach ( $m[1] as $k ) $keys[ $k ] = true;
+				}
+				if ( stripos( $l, 'confirmation' ) !== false || stripos( $l, 'wp_mail' ) !== false ) {
+					$hits[] = ( $i + 1 ) . ': ' . trim( $l );
+				}
+			}
+			$files[ $rel ] = [ 'settings_keys' => array_keys( $keys ), 'lines' => array_slice( $hits, 0, 150 ) ];
+		}
+		return [ 'bricks' => BRICKS_VERSION, 'files' => $files ];
+	}
+
 }
 Lucuma_Bricks_Bridge::init();

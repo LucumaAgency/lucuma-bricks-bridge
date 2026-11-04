@@ -84,3 +84,10 @@ Pensado para imágenes subidas enormes (p. ej. planos de 8430 px) a las que Word
 - Si Bricks cambia el nombre de la meta en una versión futura, actualizar `META_CONTENT`.
 - Lo que escribe es exactamente lo que pegarías: el JSON tiene que ser válido para la versión de
   Bricks instalada (hoy 2.3.7).
+
+**Diagnóstico de correo (desde 1.4.0, solo administradores).** `GET /mail/config` (dónde está definida
+`wp_mail`, admin_email y opciones de Post SMTP sin contraseñas), `POST /mail/test {to, subject?, from?, reply_to?}`
+(envía por `wp_mail` y devuelve el resultado, el error de `wp_mail_failed`, la conversación SMTP si PHPMailer la
+expone y la última fila del registro de Post SMTP), `GET /mail/log?limit=5` (registro de Post SMTP sin el cuerpo)
+y `GET /forms/email-source` (ajustes que lee la acción Email de los formularios Bricks, con las líneas de
+confirmación y `wp_mail` del código instalado).
