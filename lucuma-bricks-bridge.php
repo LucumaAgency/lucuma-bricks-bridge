@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID)  guardando el original. Desde 1.4.0: diagnóstico de correo (envío de prueba con registro) y lectura de los ajustes que usa la acción Email de los formularios Bricks.
- * Version: 1.4.2
+ * Version: 1.5.0
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.4.2';
+	const VERSION       = '1.5.0';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -117,6 +117,10 @@ class Lucuma_Bricks_Bridge {
 		] );
 		// 1.4.0: diagnóstico de correo, solo administradores.
 		$admin = function () { return current_user_can( 'manage_options' ); };
+		register_rest_route( self::NS, '/setup', [
+			[ 'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'setup_estado' ] ],
+			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'setup_aplicar' ] ],
+		] );
 		register_rest_route( self::NS, '/setup/bricks-diag', [
 			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'bricks_diag' ],
 		] );
@@ -751,6 +755,67 @@ all(); new MutationObserver(all).observe(document.body,{childList:true,subtree:t
 	 * archivos de administración de Bricks que nombran opciones (para conocer sus claves reales
 	 * antes de activarlas por API). Parámetro ?q=texto1,texto2 (por defecto submission,smooth).
 	 */
+	/** Ajustes de Bricks que el setup inicial puede tocar (claves reales de Bricks 2.3, ver bricks-diag). */
+	const SETUP_BRICKS = [ 'smoothScroll', 'saveFormSubmissions' ];
+
+	private static function tabla_formularios() {
+		global $wpdb;
+		$tabla = $wpdb->prefix . 'bricks_form_submissions';
+		return $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $tabla ) ) === $tabla;
+	}
+
+	/** Estado del setup inicial de Lucuma: enlaces permanentes y ajustes de Bricks. */
+	public static function setup_estado() {
+		$ajustes = (array) get_option( 'bricks_global_settings', [] );
+		$bricks  = [];
+		foreach ( self::SETUP_BRICKS as $k ) $bricks[ $k ] = isset( $ajustes[ $k ] );
+		return [
+			'permalinks'      => get_option( 'permalink_structure' ),
+			'bricks'          => $bricks,
+			'tablaFormularios' => self::tabla_formularios(),
+		];
+	}
+
+	/**
+	 * Setup inicial de Lucuma (v1.5.0): { "permalinks": true, "bricks": { "smoothScroll": true,
+	 * "saveFormSubmissions": true } }. Solo las claves de SETUP_BRICKS; copia de los ajustes
+	 * anteriores en la opción lucuma_bricks_setup_backup. Si se activa guardar formularios, crea la
+	 * tabla con la clase de Bricks (como hace su pantalla de ajustes).
+	 */
+	public static function setup_aplicar( WP_REST_Request $req ) {
+		$b = (array) $req->get_json_params();
+		$hecho = [];
+		if ( ! empty( $b['permalinks'] ) ) {
+			update_option( 'permalink_structure', '/%postname%/' );
+			flush_rewrite_rules( true );
+			$hecho[] = 'permalinks';
+		}
+		if ( ! empty( $b['bricks'] ) && is_array( $b['bricks'] ) ) {
+			$ajustes = (array) get_option( 'bricks_global_settings', [] );
+			update_option( 'lucuma_bricks_setup_backup', [ 'fecha' => current_time( 'mysql' ), 'ajustes' => $ajustes ], false );
+			foreach ( $b['bricks'] as $k => $v ) {
+				if ( ! in_array( $k, self::SETUP_BRICKS, true ) ) {
+					return new WP_Error( 'clave_no_permitida', "Ajuste no permitido: $k", [ 'status' => 400 ] );
+				}
+				if ( $v ) $ajustes[ $k ] = 'on'; else unset( $ajustes[ $k ] );
+				$hecho[] = "bricks.$k=" . ( $v ? 'on' : 'off' );
+			}
+			update_option( 'bricks_global_settings', $ajustes );
+			if ( class_exists( '\Bricks\Database' ) ) \Bricks\Database::$global_settings = $ajustes;
+			if ( ! empty( $b['bricks']['saveFormSubmissions'] ) && ! self::tabla_formularios() ) {
+				$clase = '\Bricks\Integrations\Form\Submission_Database';
+				foreach ( [ 'maybe_create_table', 'create_table' ] as $m ) {
+					if ( class_exists( $clase ) && method_exists( $clase, $m ) && ( new ReflectionMethod( $clase, $m ) )->isStatic() ) {
+						call_user_func( [ $clase, $m ] );
+						$hecho[] = "tabla via $m";
+						break;
+					}
+				}
+			}
+		}
+		return [ 'hecho' => $hecho ] + self::setup_estado();
+	}
+
 	public static function bricks_diag( WP_REST_Request $req ) {
 		$ajustes = get_option( 'bricks_global_settings', [] );
 		$resumen = [];
