@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID)  guardando el original. Desde 1.4.0: diagnóstico de correo (envío de prueba con registro) y lectura de los ajustes que usa la acción Email de los formularios Bricks.
- * Version: 1.4.1
+ * Version: 1.4.2
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.4.1';
+	const VERSION       = '1.4.2';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -117,6 +117,9 @@ class Lucuma_Bricks_Bridge {
 		] );
 		// 1.4.0: diagnóstico de correo, solo administradores.
 		$admin = function () { return current_user_can( 'manage_options' ); };
+		register_rest_route( self::NS, '/setup/bricks-diag', [
+			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'bricks_diag' ],
+		] );
 		register_rest_route( self::NS, '/mail/config', [
 			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'mail_config' ],
 		] );
@@ -743,6 +746,39 @@ all(); new MutationObserver(all).observe(document.body,{childList:true,subtree:t
 	}
 
 	/** Qué función wp_mail está activa y la configuración de Post SMTP (sin contraseñas). */
+	/**
+	 * Solo lectura (v1.4.2): ajustes globales de Bricks tal como están guardados y las líneas de los
+	 * archivos de administración de Bricks que nombran opciones (para conocer sus claves reales
+	 * antes de activarlas por API). Parámetro ?q=texto1,texto2 (por defecto submission,smooth).
+	 */
+	public static function bricks_diag( WP_REST_Request $req ) {
+		$ajustes = get_option( 'bricks_global_settings', [] );
+		$resumen = [];
+		foreach ( (array) $ajustes as $k => $v ) {
+			$resumen[ $k ] = is_scalar( $v ) ? mb_substr( (string) $v, 0, 80 ) : '(' . gettype( $v ) . ')';
+		}
+		$q = array_filter( array_map( 'trim', explode( ',', (string) ( $req->get_param( 'q' ) ?: 'submission,smooth' ) ) ) );
+		$tema = get_theme_root() . '/bricks';
+		$lineas = [];
+		if ( is_dir( $tema ) && $q ) {
+			$it = new RecursiveIteratorIterator( new RecursiveDirectoryIterator( $tema . '/includes', FilesystemIterator::SKIP_DOTS ) );
+			foreach ( $it as $f ) {
+				if ( count( $lineas ) >= 80 ) break;
+				if ( substr( $f->getFilename(), -4 ) !== '.php' ) continue;
+				foreach ( file( $f->getPathname() ) as $n => $l ) {
+					foreach ( $q as $palabra ) {
+						if ( stripos( $l, $palabra ) !== false && preg_match( "/['\"][a-zA-Z_]*" . preg_quote( $palabra, '/' ) . "[a-zA-Z_]*['\"]/i", $l ) ) {
+							$lineas[] = str_replace( $tema, '', $f->getPathname() ) . ':' . ( $n + 1 ) . '  ' . mb_substr( trim( $l ), 0, 220 );
+							break;
+						}
+					}
+					if ( count( $lineas ) >= 80 ) break;
+				}
+			}
+		}
+		return [ 'bricks' => defined( 'BRICKS_VERSION' ) ? BRICKS_VERSION : null, 'ajustes' => $resumen, 'lineas' => $lineas ];
+	}
+
 	public static function mail_config() {
 		$where = null;
 		if ( function_exists( 'wp_mail' ) ) {
