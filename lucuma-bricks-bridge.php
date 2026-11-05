@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Lucuma Bricks Bridge
  * Description: Endpoint REST para leer y escribir el contenido Bricks de una página (y el header/footer de las plantillas) desde fuera (importa JSON en formato bricksCopiedElements). Con respaldo automático y restauración. Desde 1.1.0: tipo y condiciones de plantillas, crear plantillas, clases globales, noindex por página y vista previa privada de borradores. Desde 1.2.0: mapa de enlaces para navegar la vista previa. Desde 1.3.0: reemplazar el archivo de una imagen (mismo ID)  guardando el original. Desde 1.4.0: diagnóstico de correo (envío de prueba con registro) y lectura de los ajustes que usa la acción Email de los formularios Bricks.
- * Version: 1.5.0
+ * Version: 1.6.0
  * Author: Lucuma Agency
  * Requires PHP: 7.4
  */
@@ -21,7 +21,7 @@ class Lucuma_Bricks_Bridge {
 	const META_BACKUPS  = '_lucuma_bricks_backups';
 	const OPT_CLASSES   = 'bricks_global_classes';
 	const MAX_BACKUPS   = 5;
-	const VERSION       = '1.5.0';
+	const VERSION       = '1.6.0';
 	/** Plantillas: tipo y ajustes (condiciones) tal como los guarda Bricks. */
 	const META_TPL_TYPE     = '_bricks_template_type';
 	const META_TPL_SETTINGS = '_bricks_template_settings';
@@ -120,6 +120,10 @@ class Lucuma_Bricks_Bridge {
 		register_rest_route( self::NS, '/setup', [
 			[ 'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'setup_estado' ] ],
 			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'setup_aplicar' ] ],
+		] );
+		register_rest_route( self::NS, '/style', [
+			[ 'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'style_get' ] ],
+			[ 'methods' => 'POST', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'style_set' ] ],
 		] );
 		register_rest_route( self::NS, '/setup/bricks-diag', [
 			'methods' => 'GET', 'permission_callback' => $admin, 'callback' => [ __CLASS__, 'bricks_diag' ],
@@ -755,6 +759,103 @@ all(); new MutationObserver(all).observe(document.body,{childList:true,subtree:t
 	 * archivos de administración de Bricks que nombran opciones (para conocer sus claves reales
 	 * antes de activarlas por API). Parámetro ?q=texto1,texto2 (por defecto submission,smooth).
 	 */
+	/** Opciones de estilo global de Bricks (variables, categorías de variables, paleta, theme styles). */
+	const STYLE_OPTIONS = [
+		'variables'  => 'bricks_global_variables',
+		'categories' => 'bricks_global_variables_categories',
+		'palette'    => 'bricks_color_palette',
+		'themes'     => 'bricks_theme_styles',
+	];
+
+	private static function bid() {
+		return strtolower( substr( str_replace( [ '-', '_' ], '', wp_generate_password( 12, false ) ), 0, 6 ) );
+	}
+
+	/** GET /style (v1.6.0): las opciones tal como las guarda Bricks, para leer su formato antes de escribir. */
+	public static function style_get() {
+		$out = [];
+		foreach ( self::STYLE_OPTIONS as $k => $opt ) $out[ $k ] = get_option( $opt, null );
+		$out['backup'] = (bool) get_option( 'lucuma_bricks_style_backup' );
+		return $out;
+	}
+
+	/**
+	 * POST /style (v1.6.0). Copia previa en lucuma_bricks_style_backup.
+	 *   variables: [{name, value, category?}]   upsert por nombre (sin "--"); category = nombre (se crea si falta)
+	 *   palette:   {name, colors: [{name, hex}]} upsert de la paleta por nombre (reemplaza sus colores)
+	 *   theme:     {id?, label, settings}        crea o fusiona (array_replace_recursive) un theme style
+	 *   restore:   true                          vuelve a la copia previa
+	 */
+	public static function style_set( WP_REST_Request $req ) {
+		$b = (array) $req->get_json_params();
+		if ( ! empty( $b['restore'] ) ) {
+			$bk = get_option( 'lucuma_bricks_style_backup' );
+			if ( ! is_array( $bk ) ) return new WP_Error( 'no_backup', 'No hay copia previa', [ 'status' => 404 ] );
+			foreach ( self::STYLE_OPTIONS as $k => $opt ) {
+				if ( $bk[ $k ] === null ) delete_option( $opt ); else update_option( $opt, $bk[ $k ] );
+			}
+			return [ 'restored' => true ] + self::style_get();
+		}
+		$prev = [];
+		foreach ( self::STYLE_OPTIONS as $k => $opt ) $prev[ $k ] = get_option( $opt, null );
+		update_option( 'lucuma_bricks_style_backup', $prev, false );
+		$done = [];
+
+		if ( ! empty( $b['variables'] ) && is_array( $b['variables'] ) ) {
+			$vars = is_array( $prev['variables'] ) ? $prev['variables'] : [];
+			$cats = is_array( $prev['categories'] ) ? $prev['categories'] : [];
+			foreach ( $b['variables'] as $v ) {
+				$name = ltrim( sanitize_text_field( (string) ( $v['name'] ?? '' ) ), '-' );
+				if ( $name === '' || ! preg_match( '/^[a-zA-Z0-9_-]+$/', $name ) ) continue;
+				$value = trim( wp_strip_all_tags( (string) ( $v['value'] ?? '' ) ) );
+				$cat_id = '';
+				if ( ! empty( $v['category'] ) ) {
+					foreach ( $cats as $c ) if ( ( $c['name'] ?? '' ) === $v['category'] ) $cat_id = $c['id'];
+					if ( ! $cat_id ) { $cat_id = self::bid(); $cats[] = [ 'id' => $cat_id, 'name' => sanitize_text_field( $v['category'] ) ]; }
+				}
+				$found = false;
+				foreach ( $vars as &$x ) {
+					if ( ( $x['name'] ?? '' ) === $name ) { $x['value'] = $value; if ( $cat_id ) $x['category'] = $cat_id; $found = true; }
+				}
+				unset( $x );
+				if ( ! $found ) $vars[] = array_filter( [ 'id' => self::bid(), 'name' => $name, 'value' => $value, 'category' => $cat_id ] );
+				$done[] = "--$name";
+			}
+			update_option( 'bricks_global_variables', $vars );
+			update_option( 'bricks_global_variables_categories', $cats );
+		}
+
+		if ( ! empty( $b['palette']['name'] ) && is_array( $b['palette']['colors'] ?? null ) ) {
+			$pals = is_array( $prev['palette'] ) ? $prev['palette'] : [];
+			$colors = [];
+			foreach ( $b['palette']['colors'] as $c ) {
+				$hex = sanitize_hex_color( (string) ( $c['hex'] ?? '' ) );
+				if ( $hex ) $colors[] = [ 'id' => self::bid(), 'hex' => $hex, 'name' => sanitize_text_field( (string) ( $c['name'] ?? '' ) ) ];
+			}
+			$idx = null;
+			foreach ( $pals as $i => $p ) if ( ( $p['name'] ?? '' ) === $b['palette']['name'] ) $idx = $i;
+			if ( $idx === null ) $pals[] = [ 'id' => self::bid(), 'name' => sanitize_text_field( $b['palette']['name'] ), 'colors' => $colors ];
+			else $pals[ $idx ]['colors'] = $colors;
+			update_option( 'bricks_color_palette', array_values( $pals ) );
+			$done[] = 'palette ' . $b['palette']['name'];
+		}
+
+		if ( ! empty( $b['theme']['settings'] ) && is_array( $b['theme']['settings'] ) ) {
+			$themes = is_array( $prev['themes'] ) ? $prev['themes'] : [];
+			$id = sanitize_key( (string) ( $b['theme']['id'] ?? '' ) ) ?: self::bid();
+			$cur = $themes[ $id ] ?? [ 'label' => '', 'settings' => [] ];
+			if ( ! empty( $b['theme']['label'] ) ) $cur['label'] = sanitize_text_field( $b['theme']['label'] );
+			$cur['settings'] = array_replace_recursive( (array) ( $cur['settings'] ?? [] ), $b['theme']['settings'] );
+			$themes[ $id ] = $cur;
+			update_option( 'bricks_theme_styles', $themes );
+			$done[] = "theme $id";
+		}
+
+		// Bricks regenera sus archivos de estilo global al guardar desde el editor; aquí se limpia la caché.
+		if ( function_exists( 'wp_cache_flush' ) ) wp_cache_flush();
+		return [ 'hecho' => $done ] + self::style_get();
+	}
+
 	/** Ajustes de Bricks que el setup inicial puede tocar (claves reales de Bricks 2.3, ver bricks-diag). */
 	const SETUP_BRICKS = [ 'smoothScroll', 'saveFormSubmissions' ];
 
